@@ -7,10 +7,11 @@ Usage (from the project folder, with the venv active):
 Optional: set an NVD API key for faster downloads (PowerShell):
     $env:NVD_API_KEY = "your-key-here"
 
-Output: data/processed/vulns.csv
+Output: data/processed/vulns.csv plus vulns.csv.meta.json (provenance)
 """
 import argparse
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -33,13 +34,20 @@ WINDOW_DAYS = 119  # NVD allows at most 120 days per date-range query
 
 # ---------------------------------------------------------------- KEV
 def download_kev():
-    """Return a DataFrame: cve_id, kev_date_added."""
+    """Return a DataFrame: cve_id, kev_date_added.
+
+    The feed release date is attached as ``df.attrs["kev_release"]`` so the
+    provenance sidecar records which KEV snapshot was used, not just today's
+    download time.
+    """
     r = requests.get(KEV_URL, timeout=60)
     r.raise_for_status()
-    items = r.json()["vulnerabilities"]
+    payload = r.json()
+    items = payload["vulnerabilities"]
     df = pd.DataFrame(items)[["cveID", "dateAdded"]]
     df.columns = ["cve_id", "kev_date_added"]
     df["kev_date_added"] = pd.to_datetime(df["kev_date_added"])
+    df.attrs["kev_release"] = payload.get("dateReleased", "")
     return df
 
 
@@ -57,6 +65,7 @@ def download_epss(date=None):
     df = pd.read_csv(io.StringIO(text), skiprows=1)
     df.columns = ["cve_id", "epss", "epss_percentile"]
     df["epss_model_version"] = version
+    df["epss_snapshot_date"] = date or datetime.now().strftime("%Y-%m-%d")
     return df
 
 
@@ -82,6 +91,14 @@ def _products(configurations):
                     if len(parts) > 4:
                         found.add(f"{parts[3]}:{parts[4]}")
     return ";".join(sorted(found))
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def parse_nvd_item(item):
@@ -197,7 +214,25 @@ def main():
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False)
+    meta = {
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "start": a.start, "end": a.end,
+        "nvd_start": a.start, "nvd_end": a.end,
+        "epss_snapshot_date": str(epss["epss_snapshot_date"].iloc[0]),
+        "epss_model_version": str(epss["epss_model_version"].iloc[0]),
+        "kev_release": kev.attrs.get("kev_release", ""),
+        "kev_snapshot_date": datetime.now().strftime("%Y-%m-%d"),
+        "kev_rows": int(len(kev)), "nvd_rows": int(len(nvd)),
+        "output_rows": int(len(df)),
+        "output_sha256": sha256_file(out),
+        "sources": ["NVD 2.0", "EPSS", "CISA KEV"],
+        "notes": "KEV is downloaded as the current feed; labels are filtered "
+                 "by kev_date_added at evaluation time. EPSS is snapshot-dated.",
+    }
+    meta_path = out.with_suffix(out.suffix + ".meta.json")
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"Saved {len(df)} rows to {out}")
+    print(f"Metadata written to {meta_path}")
     print(df[["cvss", "epss", "in_kev"]].describe(include="all"))
 
 
